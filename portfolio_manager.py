@@ -1,45 +1,28 @@
 from typing import List
-import importlib, pandas as pd
+import importlib, pkgutil, pandas as pd
 from strategies import REGISTRY, parse_strat_name
 
 class PortfolioManager:
     def __init__(self, strat_names: List[str]):
-        # сначала подгружаем модули, чтобы REGISTRY заполнился
-        self._import_strats(strat_names)
-        # затем создаём инстансы со всеми параметрами
+        # Импортируем все модули в strategies/, чтобы REGISTRY был полностью заполнен
+        self._import_all_strats()
         self.strategies = []
         for name in strat_names:
             base, params = parse_strat_name(name)
             if base not in REGISTRY:
                 raise ValueError(f"Unknown strategy: {base}")
             if base == "pair_reversion" and params:
-                # специальный кейс для pair_reversion
                 self.strategies.append(REGISTRY[base](pair=tuple(params)))
             else:
                 self.strategies.append(REGISTRY[base]())
 
     @staticmethod
-    def _import_strats(names):
-        """
-        Пытаемся импортировать strategies.<base>;
-        если нет модуля, пробуем strategies.intraday (там лежат все intraday-стратегии).
-        """
-        for n in names:
-            base = n.split(":", 1)[0]
-            if base in REGISTRY:
-                continue
-            try:
-                importlib.import_module(f"strategies.{base}")
-            except ModuleNotFoundError:
-                # fallback для intraday-стратегий
-                try:
-                    importlib.import_module("strategies.intraday")
-                except ModuleNotFoundError:
-                    # если и здесь не нашлось — ошибка
-                    raise ImportError(f"Cannot import strategy module for '{base}'")
-            # после импорта проверим, зарегистрировалась ли стратегия
-            if base not in REGISTRY:
-                raise ValueError(f"Strategy '{base}' not found in REGISTRY after import")
+    def _import_all_strats():
+        # Берём реальный путь пакета strategies
+        import strategies
+        for finder, module_name, is_pkg in pkgutil.iter_modules(strategies.__path__):
+            # импортируем каждый файл strategies/<module_name>.py
+            importlib.import_module(f"strategies.{module_name}")
 
     def generate_weights(self, df: pd.DataFrame) -> pd.DataFrame:
         weights = pd.DataFrame(index=df.index)
