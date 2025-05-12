@@ -95,6 +95,8 @@ def cli():
     p.add_argument("--intraday", action="store_true", help="Use intraday data")
     p.add_argument("--interval", type=int, choices=[1, 5, 15, 30], default=5,
                    help="Bar interval in minutes for intraday")
+    p.add_argument("--per-symbol", action="store_true",
+                   help = "Run back‑test independently for every symbol and show table")
 
     args = p.parse_args()
 
@@ -116,7 +118,7 @@ def cli():
         try:
             refresh = 0 if not args.refresh else -1
             uni = get_share_universe(refresh_hours=refresh)
-            cols = ["ticker", "figi", "currency", "class", "name"]
+            cols = ["ticker", "figi", "currency", "class", "name", "last"]
             print(uni[cols].to_string(index=False))
         except UniverseError as e:
             print(e)
@@ -156,6 +158,41 @@ def cli():
                 print(f"  {sym1}/{sym2} – {len(sub)} points")
         return
 
+    # -------------------------------------------------
+    #  Индивидуальный бэктест «по каждому тикеру»
+    # -------------------------------------------------
+    if args.per_symbol:
+        rows = []
+        for sym in args.symbols:
+            # 1) Загружаем только этот тикер
+            try:
+                df_sym = build_price_dataframe([sym], **load_kwargs)
+            except SystemExit as e:
+                print(f"[WARN] {sym}: {e}")
+                continue
+
+            # 2) Считаем веса стратегий
+            wts_sym = PortfolioManager(args.strats).generate_weights(df_sym)
+
+            # 3) Берём последние 756 дней
+            df_bt  = df_sym.tail(365)
+            w_bt   = wts_sym.loc[df_bt.index]
+
+            # 4) Бэктест и сбор метрик
+            _, perf = run_backtest(df_bt, w_bt)
+            rows.append([sym,
+                         f"{perf['CAGR']:.2%}",
+                         f"{perf['Sharpe']:.2f}",
+                         f"{perf['MaxDD']:.2%}",
+                         perf['Trades']])
+
+        # 5) Вывод таблицы
+        table = pd.DataFrame(rows,
+                             columns=["Ticker", "CAGR", "Sharpe", "MaxDD", "Trades"])
+        print("\nPer‑symbol back‑test (1 year, 365 d):")
+        print(table.to_string(index=False))
+        return  # не продолжаем дальше
+
     if not args.symbols:
         p.error("symbols required unless --list is used")
 
@@ -184,7 +221,7 @@ def cli():
         print(f"  CAGR (среднегодовой рост капитала) : {perf['CAGR']:.2%}")
         print(f"  Sharpe (доход на единицу риска): {perf['Sharpe']:.2f}")
         print(f"  MaxDD (максимальная просадка): {perf['MaxDD']:.2%}")
-
+        print(f"  Trades (количество сделок) : {perf['Trades']}")
 
 if __name__ == "__main__":
     cli()
