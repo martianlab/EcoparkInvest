@@ -1,7 +1,12 @@
+"""
+  python breakout_backtests.py --currency hkd
+"""
 import os
 import math
 import time
 import random
+import argparse
+import requests
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -22,40 +27,30 @@ SL_GRID       = [0.003, 0.005, 0.01]
 DELTA_GRID    = [0.001, 0.002, 0.003]
 LOOKBACK_GRID = [10, 20, 30]
 
-# ─── ТОКЕН ────────────────────────────────────────────────────────────────────
+# ─── ТОКЕНЫ И НАСТРОЙКИ ────────────────────────────────────────────────────────
 TOKEN_INVEST = os.getenv("TINKOFF_TOKEN")
+TG_TOKEN     = os.getenv("TG_BOT_TOKEN")
+TG_CHAT_ID   = os.getenv("TG_CHAT_ID")
 
 
-def fetch_all_ruble_tickers(client: Client) -> list[str]:
-    """
-    Возвращает список тикеров всех доступных рублёвых акций на MOEX.
-    Фильтрация по:
-      - instrument_status = BASE
-      - api_trade_available_flag = True
-      - currency = "RUB"
-    """
+def fetch_all_tickers_by_currency(client: Client, currency: str) -> list[str]:
     tickers = []
-    for inst in client.instruments.shares(
-            instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
-    ).instruments:
-        if inst.api_trade_available_flag and inst.currency == "rub":
+    for inst in client.instruments.shares(instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE).instruments:
+        if inst.api_trade_available_flag and inst.currency.lower() == currency.lower():
             tickers.append(inst.ticker)
     return tickers
 
 
-def resolve_figi(ticker: str, client: Client) -> str | None:
-    for inst in client.instruments.shares(
-            instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
-    ).instruments:
+def resolve_figi(ticker: str, client: Client, currency: str) -> str | None:
+    for inst in client.instruments.shares(instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE).instruments:
         if (inst.ticker.upper() == ticker.upper()
                 and inst.api_trade_available_flag
-                and inst.currency == "rub"):
+                and inst.currency.lower() == currency.lower()):
             return inst.figi
     return None
 
 
 def fetch_candles(figi: str, interval, days: int) -> pd.DataFrame:
-    """Загружает минутные свечи за последние days дней, возвращает DataFrame с часовым поясом Moscow."""
     since = now() - timedelta(days=days)
     rows = []
     with Client(TOKEN_INVEST) as cl:
@@ -91,7 +86,6 @@ def fetch_candles(figi: str, interval, days: int) -> pd.DataFrame:
 
 
 def backtest(df: pd.DataFrame, lookback: int, delta: float, tp: float, sl: float) -> tuple[float,int,int,int]:
-    """Запускаем одиночный бэктест, возвращаем (PnL %, trades, wins, losses)."""
     df = df.copy()
     df["hi_lvl"]  = df["high"].rolling(lookback).max().shift(1)
     df["vol_ma"] = df["vol"].rolling(lookback).mean().shift(1)
@@ -103,7 +97,6 @@ def backtest(df: pd.DataFrame, lookback: int, delta: float, tp: float, sl: float
     trades = wins = losses = 0
 
     for _, row in df.iterrows():
-        # выход по TP/SL
         if pos_qty:
             change = row.close / entry_px - 1
             if change >= tp or change <= -sl:
@@ -114,7 +107,6 @@ def backtest(df: pd.DataFrame, lookback: int, delta: float, tp: float, sl: float
                 trades += 1
                 pos_qty = 0
 
-        # вход по пробою с объёмом
         if pos_qty == 0 and row.close > row.hi_lvl and (row.close - row.hi_lvl) / row.hi_lvl >= delta:
             if row.vol > row.vol_ma:
                 risk_cash = cap * RISK_PCT
@@ -132,17 +124,36 @@ def backtest(df: pd.DataFrame, lookback: int, delta: float, tp: float, sl: float
     return pnl_pct, trades, wins, losses
 
 
+def send_file_to_telegram(filepath: str, caption: str = ""):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("❌ TG_BOT_TOKEN или TG_CHAT_ID не заданы.")
+        return
+
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
+    with open(filepath, "rb") as file:
+        response = requests.post(url, data={"chat_id": TG_CHAT_ID, "caption": caption}, files={"document": file})
+    if response.status_code == 200:
+        print("📤 Результаты отправлены в Telegram.")
+    else:
+        print(f"❌ Ошибка при отправке в Telegram: {response.text}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Backtest volume breakout strategy.")
+    parser.add_argument("--currency", default="rub", help="Валюта тикеров (по умолчанию: rub)")
+    args = parser.parse_args()
+    currency = args.currency.lower()
+
     results = []
 
     with Client(TOKEN_INVEST) as client:
-        tickers = fetch_all_ruble_tickers(client)
-        print(f"Найдено {len(tickers)} рублёвых тикеров для анализа.")
+        tickers = fetch_all_tickers_by_currency(client, currency)
+        print(f"Найдено {len(tickers)} тикеров с валютой {currency.upper()} для анализа.")
 
     for ticker in tickers:
         try:
             with Client(TOKEN_INVEST) as client:
-                figi = resolve_figi(ticker, client)
+                figi = resolve_figi(ticker, client, currency)
             if not figi:
                 print(f"❌ {ticker}: FIGI не найден, пропускаем.")
                 continue
@@ -177,16 +188,18 @@ def main():
                 "losses":   best_losses,
             })
 
-            time.sleep(0.5)  # не превышаем rate‐limit
+            time.sleep(0.5)
 
         except Exception as e:
             print(f"❌ {ticker}: ошибка {e}, пропускаем.")
 
-    # Сохраняем результаты
     df_res = pd.DataFrame(results)
-    filename = f"backtest_results_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    df_res = df_res.sort_values(by="pnl_pct", ascending=False)
+    filename = f"backtest_results_{currency.upper()}_{datetime.now():%Y%m%d_%H%M%S}.csv"
     df_res.to_csv(filename, index=False)
     print(f"Готово! Результаты сохранены в {filename}")
+
+    send_file_to_telegram(filename, caption=f"Результаты бэктеста ({currency.upper()})")
 
 
 if __name__ == "__main__":

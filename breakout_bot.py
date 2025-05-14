@@ -327,28 +327,38 @@ class BreakoutBot:
         vol_ma = self.df["vol"].rolling(lb).mean().shift(1).iat[-1]
         close, vol = c["close"], c["vol"]
 
+        # === выход из позиции ===
         if self.pos_qty:
-            change = close/self.entry_px - 1
+            change = close / self.entry_px - 1
             if change >= self.best["tp"] or change <= -self.best["sl"]:
-                pnl = (close*self.pos_qty - self.entry_val) - close*self.pos_qty*COMMISSION
-                res = "✅ TP hit" if change >= self.best["tp"] else "🛑 SL hit"
-                self.capital += pnl
-                tg_send(f"{res} @ `{close}` pnl `{pnl:.2f}` equity `{self.capital:.2f}`")
+                proceeds = close * self.pos_qty          # валовая выручка
+                pnl_gross = proceeds - self.entry_val    # до комиссии
+                pnl_net   = pnl_gross - proceeds * COMMISSION
+                self.capital += pnl_net
+                res  = "✅ TP hit" if change >= self.best["tp"] else "🛑 SL hit"
+                word = "прибыль" if pnl_net >= 0 else "убыток"
+                tg_send(f"{res} @ `{close}` {word} `{pnl_net:.2f}` equity `{self.capital:.2f}`")  ### CHANGED ###
                 self._close_position()
                 return
 
-        if not self.pos_qty and close > hi_lvl and (close - hi_lvl)/hi_lvl >= self.best["delta"] and vol > vol_ma:
+        # === вход в позицию ===
+        if (not self.pos_qty and
+            close > hi_lvl and
+            (close - hi_lvl)/hi_lvl >= self.best["delta"] and
+            vol > vol_ma):
             risk = self.capital * RISK_PCT
-            qty = min(math.floor(risk/(close*self.best["sl"])), math.floor(self.capital/close))
+            qty  = min(math.floor(risk / (close * self.best["sl"])),
+                       math.floor(self.capital / close))
             if qty > 0:
                 self._open_position(qty, close)
 
+    # ---------- ОРДЕРА ----------
     def _open_position(self, qty: int, price: float):
-        self.pos_qty = qty
-        self.entry_px = price
+        self.pos_qty   = qty
+        self.entry_px  = price
         self.entry_val = qty * price
-        self.capital -= self.entry_val * COMMISSION
-        tg_send(f"📈 Buy {qty} @ `{price}` (live={LIVE_TRADING})")
+        cost = self.entry_val * (1 + COMMISSION)
+        tg_send(f"📈 Buy {qty} @ `{price}` cost `{cost:.2f}` (live={LIVE_TRADING})")
         if LIVE_TRADING:
             self._place_market_order(qty, OrderDirection.ORDER_DIRECTION_BUY)
 
