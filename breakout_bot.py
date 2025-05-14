@@ -93,18 +93,13 @@ from tinkoff.invest import (
 from tinkoff.invest.utils import now
 from tinkoff.invest.exceptions import RequestError
 
-# ────────────── Config ─────────────────────────────────────────────────── #
-parser = argparse.ArgumentParser(description="Breakout trading bot for Tinkoff Invest")
-parser.add_argument("ticker", nargs="?", default=os.getenv("BOT_TICKER", "VTBR"),
-                    help="Ticker to trade (default from BOT_TICKER env or VTBR)")
-parser.add_argument("--days-back", type=int, default=int(os.getenv("BOT_DAYS_BACK", "30")),
-                    help="How many days of history to fetch for backtest")
-parser.add_argument("--live", action="store_true", help="Enable real orders (LIVE_TRADING)")
-args = parser.parse_args()
+from bot_state import set_probability
+from account_state import get_account_balance
 
-TICKER = args.ticker.upper()
-DAYS_BACK = args.days_back
-INTERVAL = CandleInterval.CANDLE_INTERVAL_1_MIN
+# ────────────── Config ─────────────────────────────────────────────────── #
+TICKER = os.getenv("BOT_TICKER", "VTBR").upper()
+DAYS_BACK = int(os.getenv("BOT_DAYS_BACK", "30"))
+LIVE_TRADING = False
 
 CAPITAL_START = 50_000.0
 COMMISSION = 0.0004
@@ -115,7 +110,7 @@ SL_GRID = [0.003, 0.005, 0.01]
 DELTA_GRID = [0.001, 0.002, 0.003]
 LOOKBACK_GRID = [10, 20, 30]
 
-LIVE_TRADING = args.live
+INTERVAL = CandleInterval.CANDLE_INTERVAL_1_MIN
 
 TOKEN_INVEST = os.getenv("TINKOFF_TOKEN")
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
@@ -134,7 +129,6 @@ def tg_send(text: str) -> None:
     if not TG_TOKEN or not TG_CHAT_ID:
         log.debug("TG not configured: %s", text)
         return
-    # Prefix message with ticker
     text = f"*{TICKER}* {text}"
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
@@ -163,13 +157,6 @@ def resolve_figi(ticker: str) -> str | None:
             if inst.ticker == ticker and inst.api_trade_available_flag:
                 return inst.figi
     return None
-
-if TOKEN_INVEST is None:
-    raise SystemExit("TINKOFF_TOKEN not set")
-FIGI = resolve_figi(TICKER)
-if not FIGI:
-    raise SystemExit(f"Cannot resolve FIGI for {TICKER}")
-log.info("Resolved FIGI %s for ticker %s", FIGI, TICKER)
 
 # ──────────────────────────── Market data ───────────────────────────────── #
 def fetch_candles(figi: str, interval: CandleInterval, days: int) -> pd.DataFrame:
@@ -272,7 +259,7 @@ class BreakoutBot:
         self.df: pd.DataFrame = pd.DataFrame()
         self.best: dict | None = None
         self.day: date | None = None
-        self.capital = CAPITAL_START
+        self.capital = get_account_balance()
         self.pos_qty = 0
         self.entry_px = self.entry_val = 0.0
         self.running = True
@@ -280,7 +267,7 @@ class BreakoutBot:
     def start(self):
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
-        tg_send(f"🚀 Breakout bot started (live: `{LIVE_TRADING}`)")
+        tg_send(f"\ud83d\ude80 Breakout bot started (live: `{LIVE_TRADING}`)")
 
         self.day = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow")).date()
         self._refresh_history()
@@ -291,15 +278,16 @@ class BreakoutBot:
                 candle = fetch_latest_candle(self.figi)
                 if candle:
                     self._process_candle(candle)
-                time.sleep(60)  # раз в минуту
+                self.capital = get_account_balance()
+                time.sleep(60)
             except Exception as exc:
                 log.exception("Unhandled error: %s", exc)
-                tg_send(f"❗️ Unhandled error: `{exc}`")
+                tg_send(f"\u2757\ufe0f Unhandled error: `{exc}`")
                 time.sleep(10)
 
     def _stop(self, *_):
         self.running = False
-        tg_send("⏹ Bot stopped")
+        tg_send("\u23f9 Bot stopped")
 
     def _maybe_new_day(self):
         today = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow")).date()
@@ -312,7 +300,7 @@ class BreakoutBot:
         self.df = fetch_candles(self.figi, INTERVAL, DAYS_BACK)
         self.best = optimize_params(self.df)
         msg = (
-            "🔍 Best params for last *{}* days:\n"
+            "\ud83d\udd0d Best params for last *{}* days:\n"
             "lookback = `{lookback}`, delta = `{delta}`, tp = `{tp}`, sl = `{sl}`\n"
             "PnL = `{ret:.2f}%`, trades = `{trades}` (win {wins} / loss {losses})"
         ).format(DAYS_BACK, **self.best)
@@ -327,38 +315,42 @@ class BreakoutBot:
         vol_ma = self.df["vol"].rolling(lb).mean().shift(1).iat[-1]
         close, vol = c["close"], c["vol"]
 
-        # === выход из позиции ===
+        # Расчёт вероятности пробоя
+        delta = self.best["delta"]
+        price_progress = max(0.0, (close - hi_lvl) / (hi_lvl * delta))
+        volume_progress = vol / vol_ma if vol_ma else 0
+        prob_index = (min(price_progress, 1.0) + min(volume_progress, 1.0)) / 2
+        prob_pct = prob_index * 100
+        set_probability(TICKER, prob_pct)
+
         if self.pos_qty:
             change = close / self.entry_px - 1
             if change >= self.best["tp"] or change <= -self.best["sl"]:
-                proceeds = close * self.pos_qty          # валовая выручка
-                pnl_gross = proceeds - self.entry_val    # до комиссии
-                pnl_net   = pnl_gross - proceeds * COMMISSION
+                proceeds = close * self.pos_qty
+                pnl_gross = proceeds - self.entry_val
+                pnl_net = pnl_gross - proceeds * COMMISSION
                 self.capital += pnl_net
-                res  = "✅ TP hit" if change >= self.best["tp"] else "🛑 SL hit"
+                res = "\u2705 TP hit" if change >= self.best["tp"] else "\ud83d\udea9 SL hit"
                 word = "прибыль" if pnl_net >= 0 else "убыток"
-                tg_send(f"{res} @ `{close}` {word} `{pnl_net:.2f}` equity `{self.capital:.2f}`")  ### CHANGED ###
+                tg_send(f"{res} @ `{close}` {word} `{pnl_net:.2f}` equity `{self.capital:.2f}`")
                 self._close_position()
                 return
 
-        # === вход в позицию ===
         if (not self.pos_qty and
             close > hi_lvl and
             (close - hi_lvl)/hi_lvl >= self.best["delta"] and
             vol > vol_ma):
             risk = self.capital * RISK_PCT
-            qty  = min(math.floor(risk / (close * self.best["sl"])),
-                       math.floor(self.capital / close))
+            qty = math.floor(risk / (close * self.best["sl"]))
             if qty > 0:
                 self._open_position(qty, close)
 
-    # ---------- ОРДЕРА ----------
     def _open_position(self, qty: int, price: float):
-        self.pos_qty   = qty
-        self.entry_px  = price
+        self.pos_qty = qty
+        self.entry_px = price
         self.entry_val = qty * price
         cost = self.entry_val * (1 + COMMISSION)
-        tg_send(f"📈 Buy {qty} @ `{price}` cost `{cost:.2f}` (live={LIVE_TRADING})")
+        tg_send(f"\ud83d\udcc8 Buy {qty} @ `{price}` cost `{cost:.2f}` (live={LIVE_TRADING})")
         if LIVE_TRADING:
             self._place_market_order(qty, OrderDirection.ORDER_DIRECTION_BUY)
 
@@ -379,12 +371,37 @@ class BreakoutBot:
                     account_id=cl.users.get_accounts().accounts[0].id,
                     order_id=order_id,
                 )
-                tg_send(f"💸 Order {order_id} executed: {direction.name} {qty}")
+                tg_send(f"\ud83d\udcb8 Order {order_id} executed: {direction.name} {qty}")
         except Exception as exc:
             log.exception("Order failed: %s", exc)
-            tg_send(f"⚠️ Order failed: `{exc}`")
+            tg_send(f"\u26a0\ufe0f Order failed: `{exc}`")
+
+# ─────────────────────────────── run_bot ────────────────────────────────── #
+def run_bot(ticker: str, days_back: int = 30, live: bool = False):
+    global TICKER, DAYS_BACK, LIVE_TRADING, FIGI
+
+    TICKER = ticker.upper()
+    DAYS_BACK = days_back
+    LIVE_TRADING = live
+
+    if TOKEN_INVEST is None:
+        raise SystemExit("TINKOFF_TOKEN not set")
+
+    FIGI = resolve_figi(TICKER)
+    if not FIGI:
+        print(f"[run_bot] Не удалось получить FIGI для тикера {TICKER}")
+        return
+
+    log.info("Запуск run_bot для %s (live=%s)", TICKER, LIVE_TRADING)
+    bot = BreakoutBot(FIGI)
+    bot.start()
 
 # ─────────────────────────────── main ───────────────────────────────────── #
 if __name__ == "__main__":
-    bot = BreakoutBot(FIGI)
-    bot.start()
+    parser = argparse.ArgumentParser(description="Breakout trading bot for Tinkoff Invest")
+    parser.add_argument("ticker", nargs="?", default=TICKER, help="Ticker to trade")
+    parser.add_argument("--days-back", type=int, default=DAYS_BACK, help="Days of history")
+    parser.add_argument("--live", action="store_true", help="Enable live trading")
+    args = parser.parse_args()
+
+    run_bot(args.ticker, days_back=args.days_back, live=args.live)

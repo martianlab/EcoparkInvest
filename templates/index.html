@@ -1,0 +1,52 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="30">
+  <title>Volume Breakout Боты</title>
+  <style>
+    table, th, td { border: 1px solid black; border-collapse: collapse; padding: 5px; }
+    th { background-color: #f2f2f2; }
+    .running { color: green; font-weight: bold; }
+    .stopped { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Volume Breakout</h1>
+  <h3>💼 Баланс счёта: {{ "%.2f"|format(capital) }} ₽</h3>
+  <table>
+    <tr>
+      <th>Тикер</th><th>Доходность %</th><th>Trades</th><th>Wins</th><th>Losses</th>
+      <th>Lookback</th><th>Delta</th><th>TP</th><th>SL</th><th>Вероятность входа</th><th>Статус</th><th>Действие</th>
+    </tr>
+    {% for row in data %}
+    <tr>
+      <td>{{ row.ticker }}</td>
+      <td>{{ row.pnl_pct }}</td>
+      <td>{{ row.trades }}</td>
+      <td>{{ row.wins }}</td>
+      <td>{{ row.losses }}</td>
+      <td>{{ row.lookback }}</td>
+      <td>{{ row.delta }}</td>
+      <td>{{ row.tp }}</td>
+      <td>{{ row.sl }}</td>
+      <td>{% if row.ticker in probs %}{{ "%.0f"|format(probs[row.ticker]) }}%{% else %}—{% endif %}</td>
+      <td class="{{ 'running' if row.ticker in running else 'stopped' }}">{{ '🟢' if row.ticker in running else '🔴' }}</td>
+      <td>
+        {% if row.ticker in running %}
+        <form method="post" action="/stop/{{ row.ticker }}"><button>Остановить</button></form>
+        {% else %}
+        <form method="post" action="/start/{{ row.ticker }}">
+          <label>
+            <input type="checkbox" name="live"> live
+          </label>
+          <button>Запустить</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
